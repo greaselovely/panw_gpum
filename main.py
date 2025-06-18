@@ -211,11 +211,7 @@ class GlobalProtectLogDownloader:
         if "whitelist" not in config:
             config["whitelist"] = {
                 "description": "IPs to exclude from blocking - internal networks, trusted sources, etc.",
-                "ips": [
-                    "10.0.0.0/8",
-                    "172.16.0.0/12", 
-                    "192.168.0.0/16"
-                ]
+                "ips": []
             }
             self.save_config(config)
             self.log("Added whitelist framework to config.json")
