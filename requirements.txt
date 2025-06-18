@@ -1,0 +1,5 @@
+requests>=2.25.0
+pan-os-python>=1.7.0
+xmltodict>=0.13.0
+urllib3>=1.26.0
+setuptools>=65.0.0
