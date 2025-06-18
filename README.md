@@ -114,7 +114,7 @@ Configure KineticLull EDL service integration:
 
 ### Command Line Options
 ```bash
-# Basic operation with interactive firewall selection
+# Basic operation with interactive firewall selection, which includes adding new firewalls.
 python main.py
 
 # Specify target firewall directly
