@@ -201,14 +201,6 @@ class GlobalProtectLogDownloader:
                     "1": {
                         "name": "GlobalProtect Failed Auth",
                         "url": ""
-                    },
-                    "2": {
-                        "name": "VPN Failures", 
-                        "url": ""
-                    },
-                    "3": {
-                        "name": "SSH Brute Force",
-                        "url": ""
                     }
                 }
             }
