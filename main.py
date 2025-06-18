@@ -193,6 +193,23 @@ class GlobalProtectLogDownloader:
         else:
             config = {"firewalls": {}}
         
+    def load_config(self):
+        """
+        Load configuration from JSON file and ensure required sections exist.
+        
+        Loads the main configuration file and automatically creates missing
+        sections for KineticLull EDL integration, whitelist management, and
+        GlobalProtect settings.
+        
+        Returns:
+            dict: Complete configuration dictionary
+        """
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+        else:
+            config = {"firewalls": {}}
+            
         # Ensure KineticLull section exists
         if "KineticLull" not in config:
             config["KineticLull"] = {
@@ -206,7 +223,7 @@ class GlobalProtectLogDownloader:
             }
             self.save_config(config)
             self.log("Added KineticLull EDL framework to config.json")
-        
+            
         # Ensure whitelist section exists
         if "whitelist" not in config:
             config["whitelist"] = {
@@ -215,7 +232,7 @@ class GlobalProtectLogDownloader:
             }
             self.save_config(config)
             self.log("Added whitelist framework to config.json")
-        
+            
         # Ensure GlobalProtect section exists
         if "globalprotect" not in config:
             config["globalprotect"] = {
@@ -225,7 +242,7 @@ class GlobalProtectLogDownloader:
             }
             self.save_config(config)
             self.log("Added GlobalProtect framework to config.json")
-        
+            
         return config
     
     def save_config(self, config=None):
@@ -285,6 +302,106 @@ class GlobalProtectLogDownloader:
             except ValueError:
                 print("Please enter a number")
     
+    def discover_globalprotect_gateways(self):
+        """
+        Discover available GlobalProtect gateways and let user select the external one.
+        
+        Returns:
+            str or None: Selected gateway name, or None if discovery fails/cancelled
+        """
+        try:
+            url = f"https://{self.firewall.hostname}/api/"
+            cmd = '<show><global-protect-gateway><summary><all></all></summary></global-protect-gateway></show>'
+            params = {
+                'type': 'op',
+                'cmd': cmd,
+                'key': self.firewall.api_key
+            }
+            
+            response = requests.get(url, params=params, verify=False)
+            response.raise_for_status()
+            
+            # Save the raw XML response for debugging
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_filename = f"gateway_discovery_{self.firewall.hostname}_{timestamp}.xml"
+            debug_filepath = os.path.join(XML_DIR, debug_filename)
+            
+            with open(debug_filepath, 'w') as f:
+                f.write(response.text)
+            self.log(f"Saved gateway discovery XML to: {debug_filepath}")
+            
+            # Parse XML response
+            xml_dict = xmltodict.parse(response.text)
+            
+            # Check for success
+            if xml_dict.get('response', {}).get('@status') != 'success':
+                error_msg = xml_dict.get('response', {}).get('msg', 'Unknown error')
+                self.log(f"Warning: Failed to discover gateways: {error_msg}")
+                return None
+            
+            # Extract gateway information from result text
+            result_text = xml_dict.get('response', {}).get('result', '')
+            if not result_text:
+                self.log("Warning: No gateway information found")
+                return None
+            
+            self.log(f"Gateway discovery result text: {result_text}")
+            
+            # Parse gateway names from the result text
+            gateways = []
+            lines = result_text.strip().split('\n')
+            
+            for line in lines:
+                line = line.strip()
+                # Look for lines that contain a gateway name followed by connection count
+                # Format: "GP-GW-01 : 30590"
+                if ':' in line and not 'gateway name' in line.lower() and not 'successful connections' in line.lower():
+                    # This should be a gateway line like "GP-GW-01 : 30590"
+                    parts = line.split(':')
+                    if len(parts) >= 2:
+                        gateway_name = parts[0].strip()
+                        # Validate that this looks like a gateway name (not empty, not just numbers)
+                        if gateway_name and not gateway_name.isdigit():
+                            gateways.append(gateway_name)
+                            self.log(f"Found gateway: {gateway_name}")
+            
+            if not gateways:
+                self.log("Warning: No GlobalProtect gateways found in result text")
+                return None
+            
+            if len(gateways) == 1:
+                selected_gateway = gateways[0]
+                self.log(f"Auto-selected single gateway: {selected_gateway}")
+                return selected_gateway
+            
+            # Multiple gateways found - let user choose
+            print(f"\nFound {len(gateways)} GlobalProtect gateways:")
+            for i, gateway in enumerate(gateways, 1):
+                print(f"{i}. {gateway}")
+            print("Note: Select the EXTERNAL gateway (not internal/site-to-site gateways)")
+            
+            while True:
+                try:
+                    choice = input(f"\nSelect external gateway (1-{len(gateways)}): ").strip()
+                    choice_num = int(choice)
+                    
+                    if 1 <= choice_num <= len(gateways):
+                        selected_gateway = gateways[choice_num - 1]
+                        self.log(f"Selected gateway: {selected_gateway}")
+                        return selected_gateway
+                    else:
+                        print(f"Invalid choice. Please enter 1-{len(gateways)}")
+                        
+                except ValueError:
+                    print("Please enter a valid number")
+                except KeyboardInterrupt:
+                    print("\nGateway selection cancelled")
+                    return None
+            
+        except Exception as e:
+            self.log(f"Warning: Gateway discovery failed: {e}")
+            return None
+    
     def authenticate_firewall(self, fw_ip):
         """
         Authenticate to firewall and store API key for future use.
@@ -327,6 +444,20 @@ class GlobalProtectLogDownloader:
             self.save_config()
             
             self.firewall = fw
+            
+            # Discover and configure GlobalProtect gateway after successful authentication
+            current_gateway = self.config.get("globalprotect", {}).get("gateway_name")
+            if current_gateway == "CHANGE_ME":
+                self.log("Discovering GlobalProtect gateways...")
+                discovered_gateway = self.discover_globalprotect_gateways()
+                
+                if discovered_gateway:
+                    self.config["globalprotect"]["gateway_name"] = discovered_gateway
+                    self.save_config()
+                    self.log(f"Updated gateway_name in config: {discovered_gateway}")
+                else:
+                    self.log("Gateway discovery failed - gateway_name remains as CHANGE_ME")
+            
             return True
             
         except PanDeviceError as e:
@@ -334,11 +465,25 @@ class GlobalProtectLogDownloader:
             return False
     
     def get_last_timestamp(self, fw_ip):
-        """Get last query timestamp for firewall"""
+        """
+        Get the last query timestamp for a specific firewall.
+        
+        Args:
+            fw_ip (str): Firewall IP address
+            
+        Returns:
+            str or None: Last query timestamp in YYYY/MM/DD HH:MM:SS format
+        """
         return self.config["firewalls"].get(fw_ip, {}).get("last_timestamp")
     
     def update_last_timestamp(self, fw_ip, timestamp):
-        """Update last query timestamp for firewall"""
+        """
+        Update the last query timestamp for a firewall.
+        
+        Args:
+            fw_ip (str): Firewall IP address
+            timestamp (str): Timestamp in YYYY/MM/DD HH:MM:SS format
+        """
         if fw_ip not in self.config["firewalls"]:
             self.config["firewalls"][fw_ip] = {}
         
@@ -346,7 +491,18 @@ class GlobalProtectLogDownloader:
         self.save_config()
     
     def build_query(self, fw_ip):
-        """Build log query with timestamp filtering if available"""
+        """
+        Build GlobalProtect log query with optional timestamp filtering.
+        
+        Creates a log query that searches for authentication failures. If a last
+        query timestamp exists, adds incremental filtering to only get new logs.
+        
+        Args:
+            fw_ip (str): Firewall IP address for timestamp lookup
+            
+        Returns:
+            str: Formatted log query string for PAN-OS API
+        """
         base_query = f"(error contains '{SEARCH_TEXT}')"
         
         last_timestamp = self.get_last_timestamp(fw_ip)
@@ -361,7 +517,18 @@ class GlobalProtectLogDownloader:
         return query
     
     def submit_log_query(self, fw_ip):
-        """Submit GlobalProtect log query and return job ID"""
+        """
+        Submit GlobalProtect log query to firewall and return job ID.
+        
+        Args:
+            fw_ip (str): Firewall IP address
+            
+        Returns:
+            str: Job ID for tracking query progress
+            
+        Raises:
+            Exception: If query submission fails or no job ID returned
+        """
         query = self.build_query(fw_ip)
         
         try:
@@ -397,7 +564,18 @@ class GlobalProtectLogDownloader:
             raise Exception(f"Failed to submit log query: {e}")
     
     def check_job_status(self, job_id):
-        """Check job status and return (status, progress)"""
+        """
+        Check the status and progress of a log query job.
+        
+        Args:
+            job_id (str): Job ID from submit_log_query
+            
+        Returns:
+            tuple: (status, progress) where status is job state and progress is completion percentage
+            
+        Raises:
+            Exception: If status check fails
+        """
         try:
             url = f"https://{self.firewall.hostname}/api/"
             params = {
@@ -427,7 +605,18 @@ class GlobalProtectLogDownloader:
             raise Exception(f"Failed to check job status: {e}")
     
     def wait_for_job(self, job_id):
-        """Wait for job completion"""
+        """
+        Wait for a log query job to complete with progress monitoring.
+        
+        Args:
+            job_id (str): Job ID to monitor
+            
+        Returns:
+            bool: True if job completed successfully
+            
+        Raises:
+            Exception: If job fails or times out
+        """
         self.log(f"Waiting for job {job_id} to complete...")
         start_time = time.time()
         
@@ -454,7 +643,18 @@ class GlobalProtectLogDownloader:
         raise Exception(f"Job timed out after {JOB_TIMEOUT} seconds")
     
     def download_job_results(self, job_id):
-        """Download job results and return raw XML"""
+        """
+        Download the results of a completed log query job.
+        
+        Args:
+            job_id (str): Completed job ID
+            
+        Returns:
+            str: Raw XML log data from firewall
+            
+        Raises:
+            Exception: If download fails
+        """
         try:
             url = f"https://{self.firewall.hostname}/api/"
             params = {
@@ -473,7 +673,16 @@ class GlobalProtectLogDownloader:
             raise Exception(f"Failed to download job results: {e}")
     
     def save_results(self, fw_ip, xml_data):
-        """Save XML results to file in xml_logs directory"""
+        """
+        Save raw XML log data to archive file.
+        
+        Args:
+            fw_ip (str): Firewall IP address for filename
+            xml_data (str): Raw XML log data
+            
+        Returns:
+            str: Path to saved XML file
+        """
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
         # Save XML to xml_logs directory
@@ -486,7 +695,17 @@ class GlobalProtectLogDownloader:
         return xml_filepath
     
     def is_ip_whitelisted(self, ip_address):
-        """Check if an IP address is in the whitelist"""
+        """
+        Check if an IP address is in the whitelist.
+        
+        Supports both individual IP addresses and CIDR network blocks.
+        
+        Args:
+            ip_address (str): IP address to check
+            
+        Returns:
+            bool: True if IP is whitelisted, False otherwise
+        """
         whitelist_config = self.config.get("whitelist", {})
         whitelist_ips = whitelist_config.get("ips", [])
         
@@ -515,7 +734,16 @@ class GlobalProtectLogDownloader:
             return False
     
     def log_whitelisted_failure(self, ip_address, username, timestamp):
-        """Log authentication failure from whitelisted IP"""
+        """
+        Log authentication failure from a whitelisted IP address.
+        
+        Creates audit trail for security monitoring of trusted sources.
+        
+        Args:
+            ip_address (str): Source IP address
+            username (str): Username that failed authentication
+            timestamp (str): Timestamp of the failure
+        """
         try:
             with open(WHITELIST_LOG_FILE, 'a') as f:
                 f.write(f"{timestamp} - Whitelisted IP: {ip_address} - User: {username} - Failed authentication\n")
@@ -523,7 +751,14 @@ class GlobalProtectLogDownloader:
             self.log(f"Warning: Failed to log whitelisted failure: {e}")
     
     def log_whitelist_update(self, action, ip_address, source="auto"):
-        """Log whitelist additions/removals for audit purposes"""
+        """
+        Log whitelist additions and removals for audit purposes.
+        
+        Args:
+            action (str): Action performed (ADDED, REMOVED, etc.)
+            ip_address (str): IP address affected
+            source (str): Source of the change (auto, manual, etc.)
+        """
         try:
             timestamp = datetime.now().strftime('%Y/%m/%d %H:%M:%S')
             with open(WHITELIST_UPDATE_LOG, 'a') as f:
@@ -532,7 +767,15 @@ class GlobalProtectLogDownloader:
             self.log(f"Warning: Failed to log whitelist update: {e}")
     
     def get_current_globalprotect_users(self):
-        """Get current GlobalProtect users and their public IPs"""
+        """
+        Get current GlobalProtect users and their public IP addresses.
+        
+        Queries the firewall for active VPN connections to identify legitimate users
+        whose IP addresses should be whitelisted.
+        
+        Returns:
+            list: List of dictionaries containing username and public_ip keys
+        """
         gp_config = self.config.get("globalprotect", {})
         gateway_name = gp_config.get("gateway_name", "")
         auto_whitelist = gp_config.get("auto_whitelist", True)
@@ -995,7 +1238,19 @@ class GlobalProtectLogDownloader:
             return False
     
     def run(self, fw_ip=None, update_edl=False):
-        """Main execution flow with retry logic"""
+        """
+        Main execution workflow with comprehensive error handling and retry logic.
+        
+        Orchestrates the complete process of log collection, analysis, and EDL updates
+        with automatic retry capabilities for production reliability.
+        
+        Args:
+            fw_ip (str, optional): Specific firewall IP address to target
+            update_edl (bool): Whether to update EDLs after processing logs
+            
+        Returns:
+            bool: True if execution completed successfully, False otherwise
+        """
         self.update_edl_flag = update_edl
         
         # Select firewall
@@ -1063,10 +1318,24 @@ class GlobalProtectLogDownloader:
         return False
 
 def main():
-    parser = argparse.ArgumentParser(description='Download GlobalProtect authentication failure logs')
-    parser.add_argument('-f', '--frwl', help='Firewall IP address')
-    parser.add_argument('-l', '--log', action='store_true', help='Enable file logging for cron jobs')
-    parser.add_argument('-e', '--edl', action='store_true', help='Update EDL after processing logs (default: False)')
+    """
+    Main entry point for command-line execution.
+    
+    Parses command-line arguments and initializes the GlobalProtect log downloader
+    with appropriate configuration for interactive or automated execution.
+    """
+    parser = argparse.ArgumentParser(
+        description='Download GlobalProtect authentication failure logs',
+        epilog='Example: python %(prog)s -f 192.168.1.1 --edl --log'
+    )
+    parser.add_argument('-f', '--frwl', 
+                       help='Firewall IP address')
+    parser.add_argument('--log', 
+                       action='store_true', 
+                       help='Enable file logging for cron jobs')
+    parser.add_argument('-e', '--edl', 
+                       action='store_true', 
+                       help='Update EDL after processing logs (default: False)')
     args = parser.parse_args()
     
     downloader = GlobalProtectLogDownloader(enable_logging=args.log)
