@@ -1,6 +1,7 @@
 *.json
 *.txt
 *.csv
+.DS_Store
 xml_logs/
 attack_graphs/
 data/
