@@ -23,9 +23,9 @@ Version: 1.0
 /____/_____/_/ |_|\____/_/\____/
 
 Example usage:
-python3 attack_analyzer.py -f <FIREWALL_IP>
+python3 attack_analyzer_live.py -f <FIREWALL_IP>
     or
-python3 attack_analyzer.py --frwl <FIREWALL_IP> --log
+python3 attack_analyzer_live.py --frwl <FIREWALL_IP> --log
 """
 
 import json
