@@ -1,5 +1,7 @@
-requests>=2.25.0
-pan-os-python>=1.7.0
-xmltodict>=0.13.0
-urllib3>=1.26.0
-setuptools>=65.0.0
+matplotlib==3.10.3
+pandas==2.3.0
+Requests==2.32.4
+urllib3==2.5.0
+xmltodict==0.14.2
+pan-os-python
+setuptools

@@ -12,6 +12,7 @@ Key Features:
 - Automatic IP whitelisting for current GlobalProtect users
 - Whitelist management with CIDR support
 - EDL integration for automatic IP blocking
+- Historical data storage in CSV format
 - Comprehensive logging and audit trails
 - Retry logic for reliable operation
 
@@ -53,6 +54,13 @@ from getpass import getpass
 from panos.firewall import Firewall
 from panos.errors import PanDeviceError
 
+# Import CSV data storage module
+try:
+    from data_storage import store_gp_attack_data
+except ImportError:
+    print("Warning: data_storage module not found. Historical data storage will be disabled.")
+    store_gp_attack_data = None
+
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -65,10 +73,11 @@ MAX_RETRIES = 3  # Maximum retry attempts
 RETRY_DELAY = 5  # Seconds to wait between retries
 XML_RETENTION_HOURS = 24  # Keep XML files for 24 hours
 XML_DIR = 'xml_logs'  # Directory for XML files
+APP_LOGS_DIR = 'app_logs'  # Directory for application logs
 IP_LIST_FILE = 'blocked_ips.txt'  # Single IP list file
-LOG_FILE = 'gp_downloader.log'  # Log file for cron jobs
-WHITELIST_LOG_FILE = 'whitelist_failures.log'  # Log file for whitelisted IP failures
-WHITELIST_UPDATE_LOG = 'whitelist_updates.log'  # Log file for whitelist changes
+LOG_FILE = os.path.join(APP_LOGS_DIR, 'gp_downloader.log')  # Log file for cron jobs
+WHITELIST_LOG_FILE = os.path.join(APP_LOGS_DIR, 'whitelist_failures.log')  # Log file for whitelisted IP failures
+WHITELIST_UPDATE_LOG = os.path.join(APP_LOGS_DIR, 'whitelist_updates.log')  # Log file for whitelist changes
 
 class GlobalProtectLogDownloader:
     """
@@ -79,7 +88,8 @@ class GlobalProtectLogDownloader:
     2. Querying GlobalProtect authentication failure logs
     3. Managing IP whitelists and blocklists
     4. Updating External Dynamic Lists (EDLs)
-    5. Maintaining audit trails and logging
+    5. Storing historical data in CSV format
+    6. Maintaining audit trails and logging
     
     Attributes:
         logger: Logging instance for output management
@@ -99,6 +109,7 @@ class GlobalProtectLogDownloader:
         self.config = self.load_config()
         self.firewall = None
         self.ensure_xml_directory()
+        self.ensure_app_logs_directory()
         self.cleanup_old_files()
     
     def setup_logging(self, enable_logging):
@@ -153,6 +164,17 @@ class GlobalProtectLogDownloader:
             os.makedirs(XML_DIR)
             self.log(f"Created directory: {XML_DIR}")
     
+    def ensure_app_logs_directory(self):
+        """
+        Create app logs directory if it doesn't exist.
+        
+        Creates the directory specified by APP_LOGS_DIR constant for storing
+        application log files.
+        """
+        if not os.path.exists(APP_LOGS_DIR):
+            os.makedirs(APP_LOGS_DIR)
+            self.log(f"Created directory: {APP_LOGS_DIR}")
+    
     def cleanup_old_files(self):
         """
         Remove XML log files older than the retention period.
@@ -181,8 +203,8 @@ class GlobalProtectLogDownloader:
         Load configuration from JSON file and ensure required sections exist.
         
         Loads the main configuration file and automatically creates missing
-        sections for KineticLull EDL integration, whitelist management, and
-        GlobalProtect settings.
+        sections for KineticLull EDL integration, whitelist management,
+        GlobalProtect settings, and data storage configuration.
         
         Returns:
             dict: Complete configuration dictionary
@@ -193,23 +215,8 @@ class GlobalProtectLogDownloader:
         else:
             config = {"firewalls": {}}
         
-    def load_config(self):
-        """
-        Load configuration from JSON file and ensure required sections exist.
+        config_updated = False
         
-        Loads the main configuration file and automatically creates missing
-        sections for KineticLull EDL integration, whitelist management, and
-        GlobalProtect settings.
-        
-        Returns:
-            dict: Complete configuration dictionary
-        """
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                config = json.load(f)
-        else:
-            config = {"firewalls": {}}
-            
         # Ensure KineticLull section exists
         if "KineticLull" not in config:
             config["KineticLull"] = {
@@ -221,7 +228,7 @@ class GlobalProtectLogDownloader:
                     }
                 }
             }
-            self.save_config(config)
+            config_updated = True
             self.log("Added KineticLull EDL framework to config.json")
             
         # Ensure whitelist section exists
@@ -230,7 +237,7 @@ class GlobalProtectLogDownloader:
                 "description": "IPs to exclude from blocking - internal networks, trusted sources, etc.",
                 "ips": []
             }
-            self.save_config(config)
+            config_updated = True
             self.log("Added whitelist framework to config.json")
             
         # Ensure GlobalProtect section exists
@@ -240,8 +247,22 @@ class GlobalProtectLogDownloader:
                 "auto_whitelist": True,
                 "description": "Set gateway_name to your GP gateway name for auto-whitelist functionality"
             }
-            self.save_config(config)
+            config_updated = True
             self.log("Added GlobalProtect framework to config.json")
+        
+        # Ensure data storage section exists
+        if "data_storage" not in config:
+            config["data_storage"] = {
+                "enabled": True,
+                "retention_days": 90,
+                "description": "Historical data storage in CSV format for trend analysis"
+            }
+            config_updated = True
+            self.log("Added data storage framework to config.json")
+        
+        # Save config if any updates were made
+        if config_updated:
+            self.save_config(config)
             
         return config
     
@@ -920,43 +941,12 @@ class GlobalProtectLogDownloader:
                 self.log(f"Failed to clean blocked IP list: {e}")
         else:
             self.log("Block list cleanup: No whitelisted IPs found in block list")
-        """Add current user IPs to whitelist if not already present"""
-        current_users = self.get_current_globalprotect_users()
-        if not current_users:
-            return
-        
-        # Get current whitelist
-        whitelist_ips = self.config.get("whitelist", {}).get("ips", [])
-        original_count = len(whitelist_ips)
-        
-        # Check each current user's IP
-        new_ips_added = []
-        for user in current_users:
-            public_ip = user['public_ip']
-            username = user['username']
-            
-            # Check if IP is already in whitelist (including CIDR ranges)
-            if not self.is_ip_whitelisted(public_ip):
-                # Add the IP to whitelist
-                whitelist_ips.append(public_ip)
-                new_ips_added.append((public_ip, username))
-                self.log_whitelist_update("ADDED", f"{public_ip} (user: {username})", "auto")
-        
-        # Save updated whitelist if changes were made
-        if new_ips_added:
-            self.config["whitelist"]["ips"] = whitelist_ips
-            self.save_config()
-            
-            self.log(f"Auto-whitelist: Added {len(new_ips_added)} new IPs from current users")
-            for ip, username in new_ips_added:
-                self.log(f"  Added: {ip} (user: {username})")
-        else:
-            self.log("Auto-whitelist: No new IPs to add - all current users already whitelisted")
     
     def extract_unique_ips(self, xml_data):
         """Extract unique source IPs from log data with failure counts, excluding whitelisted IPs"""
         ip_counts = {}
         whitelisted_failures = []
+        attack_events = []  # For historical data storage
         
         try:
             xml_dict = xmltodict.parse(xml_data)
@@ -990,6 +980,25 @@ class GlobalProtectLogDownloader:
                         break
                 
                 if ip:
+                    # Parse timestamp for historical data storage
+                    timestamp_obj = None
+                    if timestamp:
+                        try:
+                            if 'T' in timestamp:
+                                timestamp_obj = datetime.fromisoformat(timestamp.replace('Z', ''))
+                            else:
+                                timestamp_obj = datetime.strptime(timestamp, '%Y/%m/%d %H:%M:%S')
+                        except ValueError:
+                            pass
+                    
+                    # Create attack event for historical data storage
+                    if timestamp_obj:
+                        attack_events.append({
+                            'timestamp': timestamp_obj,
+                            'ip': ip,
+                            'username': username
+                        })
+                    
                     # Check if IP is whitelisted
                     if self.is_ip_whitelisted(ip):
                         # Log the whitelisted failure
@@ -1001,6 +1010,9 @@ class GlobalProtectLogDownloader:
                             ip_counts[ip] += 1
                         else:
                             ip_counts[ip] = 1
+            
+            # Store historical data if enabled
+            self.store_historical_data(attack_events)
             
             # Log summary of whitelisted failures
             if whitelisted_failures:
@@ -1036,6 +1048,43 @@ class GlobalProtectLogDownloader:
         except Exception as e:
             self.log(f"Warning: Failed to extract IPs: {e}")
             return []
+    
+    def store_historical_data(self, attack_events):
+        """
+        Store attack events in CSV format for historical analysis.
+        
+        Args:
+            attack_events (list): List of attack event dictionaries
+        """
+        # Check if data storage is enabled
+        data_storage_config = self.config.get("data_storage", {})
+        if not data_storage_config.get("enabled", True):
+            return
+        
+        # Check if CSV storage module is available
+        if store_gp_attack_data is None:
+            self.log("Warning: CSV data storage module not available")
+            return
+        
+        if not attack_events:
+            return
+        
+        try:
+            # Filter out whitelisted events for storage
+            filtered_events = []
+            for event in attack_events:
+                if not self.is_ip_whitelisted(event['ip']):
+                    filtered_events.append(event)
+            
+            if filtered_events:
+                # Store the filtered attack events
+                store_gp_attack_data(self.firewall.hostname, filtered_events, self.logger)
+                self.log(f"Stored {len(filtered_events)} attack events for historical analysis")
+            else:
+                self.log("No non-whitelisted attack events to store")
+                
+        except Exception as e:
+            self.log(f"Warning: Failed to store historical data: {e}")
     
     def load_existing_ip_list(self):
         """Load existing IP list and return as dict {ip: count}"""
@@ -1203,6 +1252,7 @@ class GlobalProtectLogDownloader:
             
             # Strip trailing slash from URL if present
             edl_url = edl_url.rstrip('/')
+            self.log(f"Using EDL URL: {edl_url}")
             
             # Get IP list
             ip_list = self.get_ip_list_for_edl()
@@ -1241,8 +1291,8 @@ class GlobalProtectLogDownloader:
         """
         Main execution workflow with comprehensive error handling and retry logic.
         
-        Orchestrates the complete process of log collection, analysis, and EDL updates
-        with automatic retry capabilities for production reliability.
+        Orchestrates the complete process of log collection, analysis, EDL updates,
+        and historical data storage with automatic retry capabilities for production reliability.
         
         Args:
             fw_ip (str, optional): Specific firewall IP address to target
@@ -1284,7 +1334,7 @@ class GlobalProtectLogDownloader:
                 # Save XML file
                 xml_file = self.save_results(selected_fw, xml_data)
                 
-                # Extract and merge IP lists
+                # Extract and merge IP lists (this also stores historical data)
                 new_ip_data = self.extract_unique_ips(xml_data)
                 ip_file = self.save_ip_list(new_ip_data)
                 
@@ -1330,7 +1380,7 @@ def main():
     )
     parser.add_argument('-f', '--frwl', 
                        help='Firewall IP address')
-    parser.add_argument('--log', 
+    parser.add_argument('-l', '--log', 
                        action='store_true', 
                        help='Enable file logging for cron jobs')
     parser.add_argument('-e', '--edl', 

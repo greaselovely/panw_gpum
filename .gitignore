@@ -1,6 +1,10 @@
 *.json
 *.txt
+*.csv
 xml_logs/
+attack_graphs/
+data/
+app_logs/
 
 !requirements.txt
 
